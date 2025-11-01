@@ -1,0 +1,17 @@
+/**:
+  ros__parameters:
+    robot_base_frame: base_footprint  # TurtleBot3 Waffle uses base_footprint
+    robot_pose_topic: /amcl_pose      # Pose from AMCL for localization
+    robot_vel_topic: /cmd_vel         # Velocity commands for TurtleBot3
+    costmap_topic: /global_costmap/costmap  # Nav2 global costmap
+    costmap_updates_topic: /global_costmap/costmap_updates  # Nav2 costmap updates
+    visualize: true                   # Visualize frontiers in RViz
+    planner_frequency: 0.05           # Planning frequency (Hz)
+    progress_timeout: 120.0            # Timeout for progress check (seconds)
+    potential_scale: 3.0              # Weight for potential field
+    orientation_scale: 0.0            # Weight for orientation (keep 0 for diff-drive)
+    gain_scale: 1.0                   # Weight for frontier gain
+    transform_tolerance: 1.0          # Tolerance for TF transforms (seconds)
+    min_frontier_size: 0.5           # Reduced for smaller maze frontiers
+    return_to_init: true              # Return to initial pose after exploration
+    row_spacing: 2.0  # Example: Set to 0.5 meters; adjust as needed for your robot/sensor coverage

@@ -70,6 +70,7 @@ Explore::Explore()
   this->declare_parameter<float>("gain_scale", 1.0);
   this->declare_parameter<float>("min_frontier_size", 0.5);
   this->declare_parameter<bool>("return_to_init", false);
+  this->declare_parameter<float>("row_spacing", 0.4);
 
   this->get_parameter("planner_frequency", planner_frequency_);
   this->get_parameter("progress_timeout", timeout);
@@ -80,6 +81,7 @@ Explore::Explore()
   this->get_parameter("min_frontier_size", min_frontier_size);
   this->get_parameter("return_to_init", return_to_init_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
+  this->get_parameter("row_spacing", row_spacing_);
 
   progress_timeout_ = timeout;
   move_base_client_ =
@@ -96,6 +98,11 @@ Explore::Explore()
                                                                      "frontier"
                                                                      "s",
                                                                      10);
+
+    initial_pose_publisher_ =
+          this->create_publisher<geometry_msgs::msg::Pose>("explore/"
+                                                           "initial_pose",
+                                                           10);
   }
 
   // Subscription to resume or stop exploration
@@ -103,12 +110,14 @@ Explore::Explore()
       "explore/resume", 10,
       std::bind(&Explore::resumeCallback, this, std::placeholders::_1));
 
+  raster_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("raster_path", 10);
+
   RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
   move_base_client_->wait_for_action_server();
   RCLCPP_INFO(logger_, "Connected to move_base nav2 server");
 
   if (return_to_init_) {
-    RCLCPP_INFO(logger_, "Getting initial pose of the robot");
+    RCLCPP_INFO(logger_, "Getting initial pose of the robot...");
     geometry_msgs::msg::TransformStamped transformStamped;
     std::string map_frame = costmap_client_.getGlobalFrameID();
     try {
@@ -117,6 +126,10 @@ Explore::Explore()
       initial_pose_.position.x = transformStamped.transform.translation.x;
       initial_pose_.position.y = transformStamped.transform.translation.y;
       initial_pose_.orientation = transformStamped.transform.rotation;
+      initial_pose_publisher_->publish(initial_pose_);
+      RCLCPP_INFO(logger_, "Position\nx: %f\ny: %f", initial_pose_.position.x, initial_pose_.position.y);
+      RCLCPP_INFO(logger_, "Orientation\nw: %f\nx: %f", initial_pose_.orientation.w, initial_pose_.orientation.x);
+      RCLCPP_INFO(logger_, "y: %f\nz: %f", initial_pose_.orientation.y, initial_pose_.orientation.z);
     } catch (tf2::TransformException& ex) {
       RCLCPP_ERROR(logger_, "Couldn't find transform from %s to %s: %s",
                    map_frame.c_str(), robot_base_frame_.c_str(), ex.what());
@@ -129,6 +142,7 @@ Explore::Explore()
       [this]() { makePlan(); });
   // Start exploration right away
   makePlan();
+  in_frontier_mode_ = true;  // New: Start in frontier mode
 }
 
 Explore::~Explore()
@@ -239,88 +253,155 @@ void Explore::visualizeFrontiers(
 
 void Explore::makePlan()
 {
-  // find frontiers
   auto pose = costmap_client_.getRobotPose();
-  // get frontiers sorted according to cost
-  auto frontiers = search_.searchFrom(pose.position);
-  RCLCPP_DEBUG(logger_, "found %lu frontiers", frontiers.size());
-  for (size_t i = 0; i < frontiers.size(); ++i) {
-    RCLCPP_DEBUG(logger_, "frontier %zd cost: %f", i, frontiers[i].cost);
+
+  if (in_frontier_mode_) {
+    // Frontier mode (original logic with visualization restored)
+    auto frontiers = search_.searchFrom(pose.position);
+    RCLCPP_DEBUG(logger_, "found %lu frontiers", frontiers.size());
+    for (size_t i = 0; i < frontiers.size(); ++i) {
+      RCLCPP_DEBUG(logger_, "frontier %zd cost: %f", i, frontiers[i].cost);
+    }
+
+    if (frontiers.empty()) {
+      RCLCPP_WARN(logger_, "No frontiers found, switching to raster mode.");
+      in_frontier_mode_ = false;
+      makePlan();  // Recurse to start raster immediately
+      return;
+    }
+
+    if (visualize_) {
+      visualizeFrontiers(frontiers);
+    }
+
+    auto frontier =
+        std::find_if_not(frontiers.begin(), frontiers.end(),
+                         [this](const frontier_exploration::Frontier& f) {
+                           return goalOnBlacklist(f.centroid);
+                         });
+    if (frontier == frontiers.end()) {
+      RCLCPP_WARN(logger_, "All frontiers traversed/tried out, switching to raster mode.");
+      in_frontier_mode_ = false;
+      makePlan();  // Recurse to start raster
+      return;
+    }
+    geometry_msgs::msg::Point target_position = frontier->centroid;
+
+    bool same_goal = same_point(prev_goal_, target_position);
+    prev_goal_ = target_position;
+    if (!same_goal || prev_distance_ > frontier->min_distance) {
+      last_progress_ = this->now();
+      prev_distance_ = frontier->min_distance;
+    }
+
+    if ((this->now() - last_progress_ >
+         tf2::durationFromSec(progress_timeout_)) && !resuming_) {
+      frontier_blacklist_.push_back(target_position);
+      RCLCPP_DEBUG(logger_, "Adding current goal to black list");
+      makePlan();
+      return;
+    }
+
+    if (resuming_) {
+      resuming_ = false;
+    }
+
+    if (same_goal) {
+      return;
+    }
+
+    RCLCPP_DEBUG(logger_, "Sending goal to move base nav2");
+
+    auto goal = nav2_msgs::action::NavigateToPose::Goal();
+    goal.pose.pose.position = target_position;
+    goal.pose.pose.orientation.w = 1.;
+    goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
+    goal.pose.header.stamp = this->now();
+    RCLCPP_INFO(logger_, "Position\nx: %f\ny: %f\nz: %f", goal.pose.pose.position.x, goal.pose.pose.position.y, goal.pose.pose.position.z);
+    RCLCPP_INFO(logger_, "Orientation\nw: %f\nx: %f", goal.pose.pose.orientation.w, goal.pose.pose.orientation.x);
+    RCLCPP_INFO(logger_, "y: %f\nz: %f", goal.pose.pose.orientation.y, goal.pose.pose.orientation.z);
+
+    auto send_goal_options =
+        rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
+    send_goal_options.result_callback =
+        [this, target_position](const NavigationGoalHandle::WrappedResult& result) {
+          reachedGoal(result, target_position);
+        };
+    move_base_client_->async_send_goal(goal, send_goal_options);
+  } else {
+    // Raster mode
+    if (raster_waypoints_.empty()) {
+      generateRasterWaypoints();
+      current_waypoint_idx_ = 0;
+    }
+
+    if (current_waypoint_idx_ >= raster_waypoints_.size()) {
+      RCLCPP_INFO(logger_, "Raster exploration complete");
+      stop(true);
+      return;
+    }
+
+    auto& wp = raster_waypoints_[current_waypoint_idx_];
+    geometry_msgs::msg::Point target_position = wp.pose.position;
+
+    bool same_goal = same_point(prev_goal_, target_position);
+    prev_goal_ = target_position;
+    if (!same_goal || prev_distance_ > 0.0) {
+      last_progress_ = this->now();
+      prev_distance_ = 0.0;
+    }
+    if ((this->now() - last_progress_ > tf2::durationFromSec(progress_timeout_)) && !resuming_) {
+      frontier_blacklist_.push_back(target_position);
+      RCLCPP_DEBUG(logger_, "Adding current waypoint to black list");
+      ++current_waypoint_idx_;
+      makePlan();
+      return;
+    }
+
+    if (resuming_) {
+      resuming_ = false;
+    }
+
+    if (same_goal) {
+      return;
+    }
+
+    RCLCPP_DEBUG(logger_, "Sending goal to move base nav2");
+
+    auto goal = nav2_msgs::action::NavigateToPose::Goal();
+    goal.pose.pose = wp.pose;
+    goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
+    goal.pose.header.stamp = this->now();
+    RCLCPP_INFO(logger_, "Position\nx: %f\ny: %f\nz: %f", goal.pose.pose.position.x, goal.pose.pose.position.y, goal.pose.pose.position.z);
+    RCLCPP_INFO(logger_, "Orientation\nw: %f\nx: %f", goal.pose.pose.orientation.w, goal.pose.pose.orientation.x);
+    RCLCPP_INFO(logger_, "y: %f\nz: %f", goal.pose.pose.orientation.y, goal.pose.pose.orientation.z);
+
+    auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
+    send_goal_options.result_callback = [this, target_position](const NavigationGoalHandle::WrappedResult& result) {
+      reachedRasterGoal(result, target_position);
+    };
+    move_base_client_->async_send_goal(goal, send_goal_options);
   }
+}
 
-  if (frontiers.empty()) {
-    RCLCPP_WARN(logger_, "No frontiers found, stopping.");
-    stop(true);
-    return;
+void Explore::reachedRasterGoal(const NavigationGoalHandle::WrappedResult& result, const geometry_msgs::msg::Point& waypoint) {
+  switch (result.code) {
+    case rclcpp_action::ResultCode::SUCCEEDED:
+      RCLCPP_DEBUG(logger_, "Waypoint reached successfully");
+      break;
+    case rclcpp_action::ResultCode::ABORTED:
+      RCLCPP_DEBUG(logger_, "Waypoint aborted; blacklisting");
+      // Optional: Add to frontier_blacklist_ or a new list
+      break;
+    case rclcpp_action::ResultCode::CANCELED:
+      RCLCPP_DEBUG(logger_, "Waypoint canceled");
+      return;
+    default:
+      RCLCPP_WARN(logger_, "Unknown result code");
+      break;
   }
-
-  // publish frontiers as visualization markers
-  if (visualize_) {
-    visualizeFrontiers(frontiers);
-  }
-
-  // find non blacklisted frontier
-  auto frontier =
-      std::find_if_not(frontiers.begin(), frontiers.end(),
-                       [this](const frontier_exploration::Frontier& f) {
-                         return goalOnBlacklist(f.centroid);
-                       });
-  if (frontier == frontiers.end()) {
-    RCLCPP_WARN(logger_, "All frontiers traversed/tried out, stopping.");
-    stop(true);
-    return;
-  }
-  geometry_msgs::msg::Point target_position = frontier->centroid;
-
-  // time out if we are not making any progress
-  bool same_goal = same_point(prev_goal_, target_position);
-
-  prev_goal_ = target_position;
-  if (!same_goal || prev_distance_ > frontier->min_distance) {
-    // we have different goal or we made some progress
-    last_progress_ = this->now();
-    prev_distance_ = frontier->min_distance;
-  }
-  // black list if we've made no progress for a long time
-  if ((this->now() - last_progress_ >
-      tf2::durationFromSec(progress_timeout_)) && !resuming_) {
-    frontier_blacklist_.push_back(target_position);
-    RCLCPP_DEBUG(logger_, "Adding current goal to black list");
-    makePlan();
-    return;
-  }
-
-  // ensure only first call of makePlan was set resuming to true
-  if (resuming_) {
-    resuming_ = false;
-  }
-
-  // we don't need to do anything if we still pursuing the same goal
-  if (same_goal) {
-    return;
-  }
-
-  RCLCPP_DEBUG(logger_, "Sending goal to move base nav2");
-
-  // send goal to move_base if we have something new to pursue
-  auto goal = nav2_msgs::action::NavigateToPose::Goal();
-  goal.pose.pose.position = target_position;
-  goal.pose.pose.orientation.w = 1.;
-  goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
-  goal.pose.header.stamp = this->now();
-
-  auto send_goal_options =
-      rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-  // send_goal_options.goal_response_callback =
-  // std::bind(&Explore::goal_response_callback, this, _1);
-  // send_goal_options.feedback_callback =
-  //   std::bind(&Explore::feedback_callback, this, _1, _2);
-  send_goal_options.result_callback =
-      [this,
-       target_position](const NavigationGoalHandle::WrappedResult& result) {
-        reachedGoal(result, target_position);
-      };
-  move_base_client_->async_send_goal(goal, send_goal_options);
+  ++current_waypoint_idx_;  // Advance to next
+  makePlan();  // Trigger next immediately
 }
 
 void Explore::returnToInitialPose()
@@ -334,7 +415,9 @@ void Explore::returnToInitialPose()
 
   auto send_goal_options =
       rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
+  RCLCPP_INFO(logger_, "Sending goal");
   move_base_client_->async_send_goal(goal, send_goal_options);
+  RCLCPP_INFO(logger_, "???");
 }
 
 bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
@@ -397,10 +480,10 @@ void Explore::start()
 void Explore::stop(bool finished_exploring)
 {
   RCLCPP_INFO(logger_, "Exploration stopped.");
-  move_base_client_->async_cancel_all_goals();
-  exploring_timer_->cancel();
+  // move_base_client_->async_cancel_all_goals();
+  // exploring_timer_->cancel();
 
-  if (return_to_init_ && finished_exploring) {
+  if (return_to_init_ && finished_exploring && !in_frontier_mode_ && (current_waypoint_idx_ >= raster_waypoints_.size())) {
     returnToInitialPose();
   }
 }
@@ -413,6 +496,87 @@ void Explore::resume()
   exploring_timer_->reset();
   // Resume immediately
   makePlan();
+}
+
+void Explore::generateRasterWaypoints() {
+  auto costmap = costmap_client_.getCostmap();
+  if (!costmap) {
+    RCLCPP_WARN(logger_, "No costmap available for raster planning");
+    return;
+  }
+
+  // Get costmap metadata
+  double origin_x = costmap->getOriginX();
+  double origin_y = costmap->getOriginY();
+  double resolution = costmap->getResolution();
+  unsigned int size_x = costmap->getSizeInCellsX();
+  unsigned int size_y = costmap->getSizeInCellsY();
+
+  // Find bottom-leftmost free cell (start from bottom-left corner, scan right then up)
+  geometry_msgs::msg::Point start_point;
+  bool found_start = false;
+  for (unsigned int my = 0; my < size_y; ++my) {  // Bottom to top (y=0 is bottom if origin_y is min)
+    for (unsigned int mx = 0; mx < size_x; ++mx) {  // Left to right
+      unsigned char cell_cost = costmap->getCost(mx, my);
+      if (cell_cost == nav2_costmap_2d::FREE_SPACE) {  // 0 == free
+        start_point.x = origin_x + (mx + 0.5) * resolution;  // Cell center
+        start_point.y = origin_y + (my + 0.5) * resolution;
+        found_start = true;
+        break;
+      }
+    }
+    if (found_start) break;
+  }
+  if (!found_start) {
+    RCLCPP_WARN(logger_, "No free space found in costmap");
+    stop(true);
+    return;
+  }
+  RCLCPP_INFO(logger_, "Starting raster from bottom-left: (%f, %f)", start_point.x, start_point.y);
+
+  // Generate raster waypoints: Horizontal rows, spaced by row_spacing (from param)
+  raster_waypoints_.clear();
+  bool left_to_right = true;  // Start direction
+
+  for (double y = origin_y; y <= origin_y + size_y * resolution; y += row_spacing_) {  // Use the param here
+    double start_x = left_to_right ? origin_x : origin_x + size_x * resolution;
+    double end_x = left_to_right ? origin_x + size_x * resolution : origin_x;
+    double step_x = left_to_right ? resolution : -resolution;  // Step by cell resolution for dense points
+
+    for (double x = start_x; (left_to_right ? x <= end_x : x >= end_x); x += step_x) {
+      unsigned int mx, my;
+      costmap->worldToMap(x, y, mx, my);
+      if (mx >= size_x || my >= size_y) continue;  // Bounds check
+
+      unsigned char cell_cost = costmap->getCost(mx, my);
+      if (cell_cost == nav2_costmap_2d::FREE_SPACE) {
+        geometry_msgs::msg::PoseStamped wp;
+        wp.header.frame_id = costmap_client_.getGlobalFrameID();
+        wp.header.stamp = this->now();
+        wp.pose.position.x = x;
+        wp.pose.position.y = y;
+        wp.pose.position.z = 0.0;
+        wp.pose.orientation.w = 1.0;  // Default orientation; adjust if needed (e.g., face forward)
+        raster_waypoints_.push_back(wp);
+      }
+    }
+    left_to_right = !left_to_right;  // Alternate direction for next row
+  }
+
+  if (raster_waypoints_.empty()) {
+    RCLCPP_WARN(logger_, "No valid waypoints generated");
+    stop(true);
+    return;
+  }
+
+  // Optional: Publish full path for visualization in RViz
+  nav_msgs::msg::Path path_msg;
+  path_msg.header.frame_id = costmap_client_.getGlobalFrameID();
+  path_msg.header.stamp = this->now();
+  path_msg.poses = raster_waypoints_;
+  raster_path_pub_->publish(path_msg);
+
+  RCLCPP_INFO(logger_, "Generated %zu raster waypoints with row spacing %f", raster_waypoints_.size(), row_spacing_);
 }
 
 }  // namespace explore

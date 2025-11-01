@@ -54,6 +54,8 @@
 #include <string>
 #include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <nav_msgs/msg/path.hpp>  // Added for Path msg
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -109,6 +111,8 @@ private:
 
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_array_publisher_;
+  rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr
+      initial_pose_publisher_;
   rclcpp::Logger logger_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
@@ -132,6 +136,14 @@ private:
   geometry_msgs::msg::Pose initial_pose_;
   void returnToInitialPose(void);
 
+  std::vector<geometry_msgs::msg::PoseStamped> raster_waypoints_;  // Queue of waypoints to send
+  size_t current_waypoint_idx_ = 0;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr raster_path_pub_;  // Optional: Publish full path for RViz viz
+
+  void generateRasterWaypoints();  // Added declaration
+  void reachedRasterGoal(const NavigationGoalHandle::WrappedResult& result,
+                         const geometry_msgs::msg::Point& waypoint);  // Added declaration
+
   // parameters
   double planner_frequency_;
   double potential_scale_, orientation_scale_, gain_scale_;
@@ -140,6 +152,8 @@ private:
   bool return_to_init_;
   std::string robot_base_frame_;
   bool resuming_ = false;
+  double row_spacing_;
+  bool in_frontier_mode_ = true;  // New: Flag to track phase (frontier first, then raster)
 };
 }  // namespace explore
 
